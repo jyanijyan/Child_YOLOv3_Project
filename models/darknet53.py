@@ -41,4 +41,6 @@ class Darknet53(nn.Module):
         x3 = self.layer3(x)   # 52x52 (small objects용)
         x4 = self.layer4(x3)  # 26x26
         x5 = self.layer5(x4)  # 13x13
+
+        # neck에서 쓰기 위해 세개를 모두 리턴
         return x3, x4, x5

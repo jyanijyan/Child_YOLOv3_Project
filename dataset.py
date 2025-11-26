@@ -1,133 +1,101 @@
 
-## Dataset + collate_fn 뼈대
-
 import os
 import glob
-from PIL import Image
+import json
+from pathlib import Path
 
+from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+
+# (super class, sub class) -> class_id
+# TODO: 실제로 사용할 클래스만 남겨서 정리하면 됨
+CLASS_MAP = {
+    ("person", "01"): 0,
+    ("road_etc", "01"): 1,
+    ("road_etc", "05"): 2,
+}
+NUM_CLASSES = len(CLASS_MAP)
 
 
 class YoloDataset(Dataset):
     """
-    - img_dir: 이미지 폴더 경로 (예: data/images)
-    - label_dir: 라벨 폴더 경로 (예: data/labels)
-    - img_size: (정사각형 가정) 예: 416
-    - transform: torchvision.transforms.Compose(...) 같은 것 (옵션)
-    """
-    def __init__(self, img_dir, label_dir, img_size=416, transform=None):
-        self.img_dir = img_dir
-        self.label_dir = label_dir
-        self.img_size = img_size
-        self.transform = transform
+    NIPA 어린이 보호구역 프로젝트용 YOLO Dataset
 
-        # jpg, png 등 확장자에 맞게 수정 가능
-        self.img_files = sorted(
-            glob.glob(os.path.join(img_dir, "*.jpg"))
-        )
+    Args:
+        img_dir (str or Path): 이미지 폴더 경로
+        label_dir (str or Path): JSON 라벨 폴더 경로
+        img_size (int): 리사이즈 기준 한 변 크기 (예: 416)
+        transform: torchvision.transforms.Compose 등 (없으면 기본 Transform 사용)
+    """
+
+    def __init__(self, img_dir, label_dir, img_size=416, transform=None):
+        self.img_dir = Path(img_dir)
+        self.label_dir = Path(label_dir)
+        self.img_size = img_size
+
+        # transform을 안 넘기면 기본 Resize + ToTensor 사용
+        if transform is None:
+            self.transform = T.Compose(
+                [
+                    T.Resize((img_size, img_size)),
+                    T.ToTensor(),  # (3, H, W), [0, 1]
+                ]
+            )
+        else:
+            self.transform = transform
+
+        # 이미지 파일 목록 (필요 시 확장자 추가)
+        self.img_files = sorted(self.img_dir.glob("*.jpg"))
 
     def __len__(self):
         return len(self.img_files)
 
-    def load_image(self, index):
+    def load_image(self, index: int) -> Image.Image:
         img_path = self.img_files[index]
         img = Image.open(img_path).convert("RGB")
-        # resize to (img_size, img_size)
-        img = img.resize((self.img_size, self.img_size))
         return img
 
-    def load_labels(self, index):
+    def load_labels(self, index: int) -> torch.Tensor:
+        """
+        JSON 라벨을 읽어서 [class_id, x_center, y_center, w, h] (0~1) 형식으로 반환
+        """
         img_path = self.img_files[index]
-        base = os.path.splitext(os.path.basename(img_path))[0]
-        label_path = os.path.join(self.label_dir, base + ".txt")
+        base = img_path.stem
+        label_path = self.label_dir / f"{base}.json"
+
+        # 라벨 파일이 없으면 빈 박스 반환
+        if not label_path.exists():
+            return torch.zeros((0, 5), dtype=torch.float32)
+
+        # JSON 읽기
+        with open(label_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        img_w = data["info"]["width"]
+        img_h = data["info"]["height"]
 
         boxes = []
-        if os.path.exists(label_path):
-            with open(label_path, "r") as f:
-                for line in f.readlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    cls, x, y, w, h = line.split()
-                    boxes.append([
-                        int(cls),
-                        float(x), float(y), float(w), float(h)
-                    ])
-        if len(boxes) == 0:
-            # 박스가 없으면 (0,5) 텐서 반환
-            return torch.zeros((0, 5), dtype=torch.float32)
-        return torch.tensor(boxes, dtype=torch.float32)
+        for ann in data["annotations"]:
+            # 1) 클래스 매핑
+            super_cls = ann["object super class"]
+            sub_cls = ann["object sub class"]
+            key = (super_cls, sub_cls)
 
-    def __getitem__(self, index):
-        img = self.load_image(index)
-        targets = self.load_labels(index)
+            # 정의한 CLASS_MAP에 없는 클래스는 스킵
+            if key not in CLASS_MAP:
+                continue
 
-        if self.transform is not None:
-            img = self.transform(img)
-        else:
-            # 기본: [0,1] 정규화 + Tensor 변환
-            img = torch.from_numpy(
-                (torch.ByteTensor(torch.ByteStorage.from_buffer(img.tobytes()))
-                 .view(img.size[1], img.size[0], 3)
-                 .numpy().astype("float32") / 255.0)
-            ).permute(2, 0, 1)  # (H,W,3) -> (3,H,W)
+            class_id = CLASS_MAP[key]
 
-        # targets: (N, 5) [class, x, y, w, h] (0~1)
-        return img, targets
-
-
-
-## 배치에서 박스 개수가 달라지므로 collate_fn 을 따로 정의
-
-def yolo_collate_fn(batch):
-    """
-    batch: list of (image, targets)
-      - image: Tensor (3,H,W)
-      - targets: Tensor (N_i, 5) [class, x, y, w, h]
-
-    return:
-      - images: Tensor (B,3,H,W)
-      - targets: Tensor (M,6) [batch_idx, class, x, y, w, h]
-    """
-    images = []
-    targets_list = []
-
-    for i, (img, targets) in enumerate(batch):
-        images.append(img)
-        if targets.numel() > 0:
-            # 각 target에 batch index 붙이기
-            batch_idx = torch.full(
-                (targets.size(0), 1),
-                i,
-                dtype=targets.dtype
-            )
-            targets_with_idx = torch.cat([batch_idx, targets], dim=1)
-            targets_list.append(targets_with_idx)
-
-    images = torch.stack(images, dim=0)
-
-    if len(targets_list) > 0:
-        targets_all = torch.cat(targets_list, dim=0)
-    else:
-        targets_all = torch.zeros((0, 6))
-
-    return images, targets_all
-
-
-## Data Loader에 적용
-
-train_dataset = YoloDataset(
-    img_dir="C:\Users\Jian Park\Desktop\JianPark\Google Study Jam\Sample Data\Sample\raw data",
-    label_dir="C:\Users\Jian Park\Desktop\JianPark\Google Study Jam\Sample Data\Sample\labeling data",
-    img_size=nnn,
-    transform=None  # 나중에 Albumentations 등으로 교체 가능하다고 함
-)
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=16,
-    shuffle=True,
-    collate_fn=yolo_collate_fn,
-    num_workers=1
-)
+            # 2) bbox 또는 polygon 처리
+            if "bbox" in ann:
+                # bbox: [x, y, w, h] (픽셀, 좌상단 기준)
+                x, y, w, h = ann["bbox"]
+            elif "polygon" in ann:
+                # polygon: [x1, y1, x2, y2, ...]
+                poly = ann["polygon"]
+                xs = poly[0::2]
+                ys = poly[1::2]
+                x_min, x_max
